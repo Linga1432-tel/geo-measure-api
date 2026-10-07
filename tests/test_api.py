@@ -6,7 +6,9 @@ from pathlib import Path
 
 os.environ["DATA_DIR"] = tempfile.mkdtemp()
 
-import geopandas as gpd  # noqa: E402
+import shapefile  # noqa: E402
+from pyproj import CRS, Transformer  # noqa: E402
+from shapely.ops import transform  # noqa: E402
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 from shapely.geometry import LineString, Point, Polygon  # noqa: E402
@@ -28,9 +30,18 @@ KML = """<?xml version="1.0" encoding="UTF-8"?>
 </Document></kml>"""
 
 
-def _zip_shapefile(gdf: gpd.GeoDataFrame) -> bytes:
+def _zip_shapefile(geom, epsg=4326) -> bytes:
+    """Write a one-polygon shapefile (+ .prj) with pyshp, in the given CRS, and zip it."""
+    if epsg != 4326:
+        t = Transformer.from_crs(4326, epsg, always_xy=True)
+        geom = transform(t.transform, geom)
     with tempfile.TemporaryDirectory() as d:
-        gdf.to_file(Path(d) / "data.shp")
+        base = str(Path(d) / "data")
+        with shapefile.Writer(base, shapeType=shapefile.POLYGON) as w:
+            w.field("id", "N")
+            w.poly([list(geom.exterior.coords)])
+            w.record(1)
+        Path(base + ".prj").write_text(CRS.from_epsg(epsg).to_wkt())
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w") as zf:
             for p in Path(d).iterdir():
@@ -59,13 +70,13 @@ def test_kml_flow():
     assert by_type["Point"]["supported"] and by_type["Point"]["area_sq_m"] is None
 
     feats = client.get(f"/api/files/{body['id']}/features/").json()
-    assert feats["results"][0]["properties"]["Name"] == "plot"
+    assert feats["results"][0]["properties"]["name"] == "plot"
 
 
 def test_shapefile_projected_crs_matches_wgs84():
-    gdf = gpd.GeoDataFrame({"id": [1]}, geometry=[SQUARE], crs="EPSG:4326")
-    a = _upload("a.zip", _zip_shapefile(gdf)).json()
-    b = _upload("b.zip", _zip_shapefile(gdf.to_crs("EPSG:3857"))).json()
+    a = _upload("a.zip", _zip_shapefile(SQUARE)).json()
+    b = _upload("b.zip", _zip_shapefile(SQUARE, 3857)).json()
+    assert a["status"] == b["status"] == "COMPLETED", (a, b)
     assert b["crs"] == "EPSG:3857"
     area = lambda i: client.get(f"/api/files/{i}/measurements/").json()["results"][0]["area_sq_m"]
     assert area(a["id"]) == pytest.approx(area(b["id"]), rel=1e-3)
@@ -83,3 +94,16 @@ def test_bad_inputs():
     assert _upload("x.zip", b"not a zip").status_code == 422
     assert _upload("x.kml", b"<not-kml/>").status_code == 422
     assert client.get("/api/files/nope/").status_code == 404
+
+
+def test_shapefile_without_prj_rejected():
+    buf = io.BytesIO()
+    with tempfile.TemporaryDirectory() as d:
+        base = str(Path(d) / "x")
+        with shapefile.Writer(base, shapeType=shapefile.POINT) as w:
+            w.field("id", "N"); w.point(1, 1); w.record(1)
+        with zipfile.ZipFile(buf, "w") as zf:
+            for ext in ("shp", "shx", "dbf"):
+                zf.write(f"{base}.{ext}", f"x.{ext}")
+    r = _upload("x.zip", buf.getvalue())
+    assert r.status_code == 422 and ".prj" in r.json()["error"]

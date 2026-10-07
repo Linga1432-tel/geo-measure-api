@@ -6,7 +6,7 @@ A FastAPI backend that accepts a **Shapefile (.zip)** or **KML**, extracts every
 
 ## Setup
 
-Requires Python 3.10+ (GeoPandas wheels bundle GDAL, no system install needed).
+Requires Python 3.10+. All dependencies are plain pip wheels. No GDAL or system libraries are needed.
 
 ```bash
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
@@ -72,7 +72,7 @@ app/
   schemas.py         Pydantic response models
   routers/files.py   HTTP layer only (validation, status codes, pagination)
   services/
-    readers.py       Safe zip extraction + Shapefile/KML reading (GeoPandas/pyogrio)
+    readers.py       Safe zip extraction + pure-Python Shapefile (pyshp) and KML (defusedxml) readers
     crs.py           UTM zone selection + cached pyproj transformers
     measurements.py  Pure functions: geometry (EPSG:4326) -> Measurement
     processing.py    Orchestrates read -> extract -> measure -> persist
@@ -83,7 +83,7 @@ tests/test_api.py    End-to-end + unit tests
 1. Validate extension, stream upload to a temp file while enforcing the size limit.
 2. Create an `UploadedFile` row (`PROCESSING`).
 3. Read: for `.zip`, extract safely (zip-slip and zip-bomb checks) and read every `.shp`;
-   for KML, read every layer (KML folders) via GDAL.
+   for KML, parse every `<Placemark>` (all folders/nesting) with a hardened XML parser.
 4. For each feature store index, GeoJSON geometry (original CRS), geometry type, CRS, properties.
 5. Status becomes `COMPLETED`, or `FAILED` with an error message. Nothing raises to the client as a 500.
 
@@ -104,7 +104,7 @@ heavily distorts area away from the equator. The test suite checks 4326 vs 3857 
 ## Design Decisions
 
 - **FastAPI over Django/DRF**: smaller surface, async upload streaming, automatic OpenAPI docs; no admin/ORM-heavy needs.
-- **GeoPandas + pyogrio**: one reader for Shapefile and KML, bundled GDAL wheels (no system GDAL). Alternatives: `fiona` (slower, older), `fastkml`/`pyshp` (more code, more format gaps).
+- **pyshp + stdlib XML instead of GeoPandas/GDAL**: far fewer dependencies, installs anywhere (including locked-down machines where GDAL DLLs are blocked) and the parsing logic is fully visible. Trade-off: fewer supported formats than GDAL (GeoPackage, KMZ, etc.), which a GDAL-backed reader (`pyogrio`) could add later.
 - **Per-feature UTM vs. a single CRS per file vs. geodesic (`pyproj.Geod`)**: per-feature UTM is accurate to ~0.1% in-zone and easy to explain and audit. Geodesic is the most accurate globally and is a good future cross-check.
 - **Measure at upload, persist results**: simple and fast reads. Trade-off: algorithm changes need re-processing.
 - **Synchronous processing** with a status field: fine for small/medium files and keeps the API contract (`PROCESSING/COMPLETED/FAILED`) ready for async workers. Alternative: Celery/RQ.
@@ -116,7 +116,8 @@ heavily distorts area away from the equator. The test suite checks 4326 vs 3857 
 
 - Why degrees can't be used for area, and how UTM zones/EPSG codes (326xx/327xx) work.
 - `always_xy=True` matters: axis order differs between EPSG:4326 definitions and GDAL/KML.
-- KML folders appear as separate GDAL layers, so reading only the default layer drops data.
+- KML nests Placemarks inside Folders/Documents, so the parser must search the whole tree; XML from users needs a hardened parser (`defusedxml`) against entity-expansion attacks.
+- GDAL-based stacks can fail to install or load on some machines (I hit an Application Control block on Windows), which pushed me to a dependency-light design.
 - Untrusted zip files need zip-slip and size checks.
 
 ## Future Scope
@@ -124,6 +125,6 @@ heavily distorts area away from the equator. The test suite checks 4326 vs 3857 
 - Background processing (Celery/RQ) with progress, and polling/webhooks.
 - PostGIS storage and spatial queries (bbox filter, intersects).
 - Geodesic (ellipsoidal) measurements as a cross-check or option; perimeter and centroid.
-- More formats: GeoJSON, GPKG; KMZ support.
+- More formats via an optional GDAL/pyogrio reader: GeoJSON, GPKG, KMZ.
 - Auto-repair invalid geometry (`make_valid`), CSV/GeoJSON export of measurements.
 - Auth, rate limiting, Docker + CI, Alembic migrations, S3 file storage.
